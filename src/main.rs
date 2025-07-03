@@ -1,16 +1,24 @@
 use anyhow::Result;
 use reqwest;
 use rmcp::{
-    ServerHandler, ServiceExt,
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool,
-    transport::stdio,
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
-use tracing_subscriber::{self, EnvFilter};
 
-// Set the base URL for the NWS API and user agent
+use tracing_subscriber::{
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    {self},
+};
+
 const NWS_API_BASE: &str = "https://api.weather.gov";
-const USER_AGENT: &str = "weather-app/1.0";
+const USER_AGENT: &str = "weather-app/2.0";
+const BIND_ADDRESS: &str = "127.0.0.1:8000";
 
 #[derive(Debug, serde::Deserialize)]
 pub struct AlertResponse {
@@ -74,15 +82,27 @@ pub struct Period {
     pub short_forecast: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetAlertsRequest {
+    #[schemars(description = "the US state to get alerts for")]
+    pub state: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetForecastRequest {
+    #[schemars(description = "latitude of the location in decimal format")]
+    pub latitude: String,
+    #[schemars(description = "longitude of the location in decimal format")]
+    pub longitude: String,
+}
+
 fn format_alerts(alerts: &[Feature]) -> String {
     if alerts.is_empty() {
         return "No active alerts found.".to_string();
     }
 
-    // Pre-allocate capacity for performance
     let mut result = String::with_capacity(alerts.len() * 200);
 
-    // Iterate through each alert and format the output
     for alert in alerts {
         result.push_str(&format!(
             "Event: {}\nArea: {}\nSeverity: {}\nStatus: {}\nHeadline: {}\n---\n",
@@ -101,10 +121,8 @@ fn format_forecast(periods: &[Period]) -> String {
         return "No forecast data available.".to_string();
     }
 
-    // Pre-allocate capacity for performance
     let mut result = String::with_capacity(periods.len() * 150);
 
-    // Iterate through each period and format the output
     for period in periods {
         result.push_str(&format!(
             "Name: {}\nTemperature: {}°{}\nWind: {} {}\nForecast: {}\n---\n",
@@ -121,21 +139,23 @@ fn format_forecast(periods: &[Period]) -> String {
 
 #[derive(Debug, Clone)]
 pub struct Weather {
+    tool_router: ToolRouter<Self>,
     client: reqwest::Client,
 }
 
-#[tool(tool_box)]
+#[tool_router]
 impl Weather {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self { client }
+        Self {
+            tool_router: Self::tool_router(),
+            client: reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .expect("Failed to create HTTP client"),
+        }
     }
 
-    // Helper function to make HTTP requests and handle responses
     async fn make_request<T>(&self, url: &str) -> Result<T, String>
     where
         T: serde::de::DeserializeOwned,
@@ -163,11 +183,10 @@ impl Weather {
     #[tool(description = "Get weather alerts for a US state")]
     async fn get_alerts(
         &self,
-        #[tool(param)]
-        #[schemars(description = "the US state to get alerts for")]
-        state: String,
+        Parameters(GetAlertsRequest { state }): Parameters<GetAlertsRequest>,
     ) -> String {
         tracing::info!("Received request for weather alerts in state: {}", state);
+
         let url = format!("{}/alerts/active?area={}", NWS_API_BASE, state);
 
         match self.make_request::<AlertResponse>(&url).await {
@@ -182,20 +201,22 @@ impl Weather {
     #[tool(description = "Get forecast using latitude and longitude coordinates")]
     async fn get_forecast(
         &self,
-        #[tool(aggr)] PointsRequest {
+        Parameters(GetForecastRequest {
             latitude,
             longitude,
-        }: PointsRequest,
+        }): Parameters<GetForecastRequest>,
     ) -> String {
         tracing::info!(
             "Received coordinates: latitude = {}, longitude = {}",
             latitude,
             longitude
         );
+
         let points_url = format!("{}/points/{},{}", NWS_API_BASE, latitude, longitude);
 
         // Get the forecast URL
         let points_result = self.make_request::<PointsResponse>(&points_url).await;
+
         let points = match points_result {
             Ok(points) => points,
             Err(e) => {
@@ -218,7 +239,7 @@ impl Weather {
     }
 }
 
-#[tool(tool_box)]
+#[tool_handler]
 impl ServerHandler for Weather {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -230,21 +251,26 @@ impl ServerHandler for Weather {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> anyhow::Result<()> {
     // Initialize tracing subscriber for logging
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "debug".to_string().into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
-    tracing::info!("Starting MCP server");
 
-    // Create the Weather service and serve it over stdio
-    let service = Weather::new().serve(stdio()).await.inspect_err(|e| {
-        tracing::error!("serving error: {:?}", e);
-    })?;
+    let service = StreamableHttpService::new(
+        || Ok(Weather::new()),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
 
-    // Wait for the service to finish
-    service.waiting().await?;
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
+    let _ = axum::serve(tcp_listener, router)
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
+        .await;
     Ok(())
 }

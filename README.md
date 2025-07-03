@@ -1,6 +1,6 @@
 # MCP Server for Weather
 
-This is a simple Model Context Protocol (MCP) server that provides weather data built using the _soon-to-be-released_ [rust-sdk](https://github.com/modelcontextprotocol/rust-sdk) originally known as the [rmcp](https://crates.io/crates/rmcp) crate.
+This is a simple Model Context Protocol (MCP) server that provides weather data built using the _soon-to-be-released_ [rust-sdk](https://github.com/modelcontextprotocol/rust-sdk).
 
 This walkthrough takes inspiration from the [quickstart guides for server developers](https://modelcontextprotocol.io/quickstart/server), which can be found on the [Model Context Protocol website](https://modelcontextprotocol.io/), and builds on the examples provided in the [rust-sdk MCP server examples](https://github.com/modelcontextprotocol/rust-sdk/tree/main/examples/servers).
 
@@ -8,10 +8,16 @@ This walkthrough takes inspiration from the [quickstart guides for server develo
 
 Want to skip the walkthrough and just run the weather server? No problem!
 
-Clone this repository, and run the following command to build and run the weather server:
+Clone this repository, and run the following commands to build and run the weather server:
 
 ```sh
-npx @modelcontextprotocol/inspector cargo run
+cargo run
+```
+
+Then, in a separate terminal, run the MCP Inspector to test the server:
+
+```sh
+npx @modelcontextprotocol/inspector
 ```
 
 This will start the MCP server and the MCP Inspector, allowing you to interact with the server and test its capabilities.
@@ -34,26 +40,28 @@ cd weather
 
 The following dependencies will need to be added to your `Cargo.toml` file.
 
-- **[rmcp](https://crates.io/crates/rmcp)**: The Model Context Protocol SDK for Rust with server and transport IO features enabled.
-- **[tokio](https://crates.io/crates/tokio)**: An asynchronous runtime for Rust, required for running the server.
-- **[serde](https://crates.io/crates/serde)**: A framework for serializing and deserializing Rust data structures with the `derive` feature for automatic implementations of `Serialize` and `Deserialize` traits.
+- **[rmcp](https://crates.io/crates/rmcp)**: The MCP SDK for Rust.
+- **[tokio](https://crates.io/crates/tokio)**: For asynchronous runtime and I/O operations.
+- **[serde](https://crates.io/crates/serde)**: For serializing and deserializing data structures.
 - **[serde_json](https://crates.io/crates/serde_json)**: For JSON serialization and deserialization.
 - **[anyhow](https://crates.io/crates/anyhow)**: For error handling.
-- **[tracing](https://crates.io/crates/tracing)**: For instrumenting applications and event-based diagnostics.
-- **[tracing-subscriber](https://crates.io/crates/tracing-subscriber)**: For subscribing to tracing events, with the `env-filter` feature for filtering logs based on environment variables.
-- **[reqwest](https://crates.io/crates/reqwest)**: An HTTP client for making requests, with the `json` feature for handling JSON data.
+- **[tracing](https://crates.io/crates/tracing)**: For logging and diagnostics.
+- **[tracing-subscriber](https://crates.io/crates/tracing-subscriber)**: For subscribing to tracing events and filtering logs.
+- **[reqwest](https://crates.io/crates/reqwest)**: For making HTTP requests to the National Weather Service API.
+- **[axum](https://crates.io/crates/axum)**: For building the HTTP server and routing requests.
 
 You can add these dependencies manually to your `Cargo.toml` file, or you can use the `cargo add` command to add them easily.
 
 ```sh
-cargo add rmcp --features server,transport-io
-cargo add tokio --features macros,rt-multi-thread
+cargo add rmcp@0.2.0 --features server,transport-sse-server,transport-io,transport-streamable-http-server,auth
+cargo add tokio --features macros,rt-multi-thread,signal
 cargo add serde --features derive
 cargo add serde_json
 cargo add anyhow
 cargo add tracing
 cargo add tracing-subscriber --features env-filter
 cargo add reqwest --features json
+cargo add axum --features macros
 ```
 
 Here is how your `Cargo.toml` should look:
@@ -66,11 +74,12 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.98"
-reqwest = { version = "0.12.19", features = ["json"] }
-rmcp = { version = "0.1.5", features = ["server", "transport-io"] }
+axum = { version = "0.8.4", features = ["macros"] }
+reqwest = { version = "0.12.22", features = ["json"] }
+rmcp = { version = "0.2.0", features = ["auth", "server", "transport-io", "transport-sse-server", "transport-streamable-http-server"] }
 serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
-tokio = { version = "1.45.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.46.0", features = ["macros", "rt-multi-thread", "signal"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 ```
@@ -90,15 +99,24 @@ Open the `src/main.rs` file and add following code to the top of the file:
 use anyhow::Result;
 use reqwest;
 use rmcp::{
-    ServerHandler, ServiceExt,
-    model::{ServerCapabilities, ServerInfo},
-    schemars, tool,
-    transport::stdio,
+    ServerHandler,
+    handler::server::{router::tool::ToolRouter, tool::Parameters},
+    model::*,
+    schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpService, session::local::LocalSessionManager,
+    },
 };
-use tracing_subscriber::{self, EnvFilter};
+
+use tracing_subscriber::{
+    layer::SubscriberExt,
+    util::SubscriberInitExt,
+    {self},
+};
 
 const NWS_API_BASE: &str = "https://api.weather.gov";
-const USER_AGENT: &str = "weather-app/1.0";
+const USER_AGENT: &str = "weather-app/2.0";
+const BIND_ADDRESS: &str = "127.0.0.1:8000";
 ```
 
 This code imports the necessary crates and modules for building the server.
@@ -216,9 +234,23 @@ pub struct Period {
     #[serde(rename = "shortForecast")]
     pub short_forecast: String,
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetAlertsRequest {
+    #[schemars(description = "the US state to get alerts for")]
+    pub state: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct GetForecastRequest {
+    #[schemars(description = "latitude of the location in decimal format")]
+    pub latitude: String,
+    #[schemars(description = "longitude of the location in decimal format")]
+    pub longitude: String,
+}
 ```
 
-These structs represent the data returned by the NWS API for weather alerts and forecasts.
+These structs represent the data returned by the NWS API for weather alerts and forecasts and how parameters for the tool's function calls will be defined.
 
 ## Adding helper functions
 
@@ -276,6 +308,7 @@ Add the following code to define a `Weather` struct that will hold the HTTP clie
 ```rust
 #[derive(Debug, Clone)]
 pub struct Weather {
+    tool_router: ToolRouter<Self>,
     client: reqwest::Client,
 }
 ```
@@ -283,15 +316,17 @@ pub struct Weather {
 Next, create the `Weather` struct which is where the tools for getting weather alerts and forecasts will be implemented.
 
 ```rust
-#[tool(tool_box)]
+#[tool_router]
 impl Weather {
     #[allow(dead_code)]
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .build()
-            .expect("Failed to create HTTP client");
-        Self { client }
+        Self {
+            tool_router: Self::tool_router(),
+            client: reqwest::Client::builder()
+                .user_agent(USER_AGENT)
+                .build()
+                .expect("Failed to create HTTP client"),
+        }
     }
 }
 ```
@@ -302,8 +337,8 @@ As demonstrated above, there will be a few HTTP requests made to the NWS API. To
 
 ```rust
 async fn make_request<T>(&self, url: &str) -> Result<T, String>
-where
-    T: serde::de::DeserializeOwned,
+    where
+        T: serde::de::DeserializeOwned,
 {
     tracing::info!("Making request to: {}", url);
 
@@ -334,11 +369,8 @@ Add the following functions to the `Weather` struct implementation to implement 
 #[tool(description = "Get weather alerts for a US state")]
 async fn get_alerts(
     &self,
-    #[tool(param)]
-    #[schemars(description = "the US state to get alerts for")]
-    state: String,
+    Parameters(GetAlertsRequest { state }): Parameters<GetAlertsRequest>,
 ) -> String {
-
     tracing::info!("Received request for weather alerts in state: {}", state);
 
     let url = format!("{}/alerts/active?area={}", NWS_API_BASE, state);
@@ -361,10 +393,10 @@ Next, implement the `get_forecast` tool to retrieve the weather forecast using l
 #[tool(description = "Get forecast using latitude and longitude coordinates")]
 async fn get_forecast(
     &self,
-    #[tool(aggr)] PointsRequest {
+    Parameters(GetForecastRequest {
         latitude,
         longitude,
-    }: PointsRequest,
+    }): Parameters<GetForecastRequest>,
 ) -> String {
     tracing::info!(
         "Received coordinates: latitude = {}, longitude = {}",
@@ -402,7 +434,7 @@ This function retrieves the weather forecast for a specific location using latit
 Next, implement the `ServerHandler` trait for the `Weather` struct as well to provide server information and capabilities. Add the following code to the `src/main.rs` file:
 
 ```rust
-#[tool(tool_box)]
+#[tool_handler]
 impl ServerHandler for Weather {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
@@ -420,22 +452,26 @@ impl ServerHandler for Weather {
 Finally, implement the `main` function to run the server. Replace the existing `main` function in `src/main.rs` with the following code:
 
 ```rust
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive(tracing::Level::DEBUG.into()))
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "debug".to_string().into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("Starting MCP server");
+    let service = StreamableHttpService::new(
+        || Ok(Weather::new()),
+        LocalSessionManager::default().into(),
+        Default::default(),
+    );
 
-    let service = Weather::new().serve(stdio()).await.inspect_err(|e| {
-        tracing::error!("serving error: {:?}", e);
-    })?;
-
-    service.waiting().await?;
-
+    let router = axum::Router::new().nest_service("/mcp", service);
+    let tcp_listener = tokio::net::TcpListener::bind(BIND_ADDRESS).await?;
+    let _ = axum::serve(tcp_listener, router)
+        .with_graceful_shutdown(async { tokio::signal::ctrl_c().await.unwrap() })
+        .await;
     Ok(())
 }
 ```
@@ -446,20 +482,22 @@ Run the following commands to format the code and build the project:
 
 ```sh
 cargo fmt
-cargo build
+cargo run
 ```
 
-If all goes well, you should see no errors, and the project will be built successfully.
+If all goes well, you should see no errors, and the server will be build successfully and running.
 
 ## Testing with MCP Inspector
 
 Test the MCP server with the [Model Context Protocol Inspector](https://github.com/modelcontextprotocol/inspector). The inspector is a web-based tool that allows you to interact with MCP servers and test their capabilities.
 
+In a separate terminal, run the MCP Inspector using the following command:
+
 ```sh
-npx @modelcontextprotocol/inspector cargo run
+npx @modelcontextprotocol/inspector
 ```
 
-Once the MCP Inspector is started, navigate to [http://127.0.0.1:6274](http://127.0.0.1:6274) in your web browser and test the tools.
+Once the MCP Inspector is started, navigate to URL listed in the terminal output and you should see the MCP Inspector interface.
 
 ## Summary
 
@@ -467,6 +505,6 @@ In this walkthrough, you built a simple MCP server that provides weather data us
 
 ## Learn more
 
-- [Model Context Protocol website](https://modelcontextprotocol.io/)
-- [MCP Rust SDK repository](https://github.com/modelcontextprotocol/rust-sdk)
-- [MCP Inspector repository](https://github.com/modelcontextprotocol/inspector)
+- [Model Context Protocol (MCP) official docs](https://modelcontextprotocol.io/)
+- [RMCP](https://github.com/modelcontextprotocol/rust-sdk)
+- [MCP Inspector](https://github.com/modelcontextprotocol/inspector)
